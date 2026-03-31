@@ -2,5 +2,7 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "node server.js"
+startCommand = "npm ci --omit=dev && node server.js"
 restartPolicyType = "always"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
