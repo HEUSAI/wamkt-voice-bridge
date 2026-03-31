@@ -10,7 +10,7 @@ app.use(express.json())
 const PORT = process.env.PORT || 3001
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ''
 const WAMKT_URL = process.env.WAMKT_URL || 'https://wamkt.notsy.com.mx'
-const OPENAI_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'
+const OPENAI_REALTIME_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17'
 const DEFAULT_PROMPT = 'Eres representante de ventas. Llamas para presentar una promoción. Español mexicano, amigable y directo. Máximo 2 oraciones. Sin emojis ni markdown.'
 
 // Prompt cache
@@ -38,7 +38,7 @@ const pool = []
 
 function createPooledWs() {
   if (!OPENAI_API_KEY) return
-  const ws = new WebSocket(OPENAI_URL, { headers: { Authorization: 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' } })
+  const ws = new WebSocket(OPENAI_REALTIME_URL, { headers: { Authorization: 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' } })
   ws._ready = false
   ws.on('open', () => { ws._ready = true; console.log('[pool] ready ' + pool.filter(w=>w._ready).length + '/' + POOL_SIZE) })
   ws.on('error', e => { console.warn('[pool] err:', e.message); const i = pool.indexOf(ws); if (i !== -1) pool.splice(i,1); setTimeout(refillPool, 1000) })
@@ -142,7 +142,7 @@ wss.on('connection', (tws, req) => {
       ows = pooled; attachOws(); startSession(prompt)
     } else {
       console.log('[bridge] Fresh WS')
-      ows = new WebSocket(OPENAI_URL, { headers: { Authorization: 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' } })
+      ows = new WebSocket(OPENAI_REALTIME_URL, { headers: { Authorization: 'Bearer ' + OPENAI_API_KEY, 'OpenAI-Beta': 'realtime=v1' } })
       attachOws()
       ows.on('open', () => { console.log('[bridge] OAI connected'); startSession(prompt) })
     }
