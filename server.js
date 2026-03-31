@@ -15,23 +15,17 @@ const DEFAULT_PROMPT = 'Eres un representante de ventas. Llamas a un prospecto p
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'wamkt-voice-bridge' }))
 
-// Prompt cache: project_id -> { prompt, ts }
-// Single in-flight promise per project_id to prevent double fetches
+// Prompt cache with deduplication
 const promptCache = new Map()
 const promptInFlight = new Map()
 const CACHE_TTL_MS = 5 * 60 * 1000
 
 async function fetchPrompt(pid) {
-  // Return cached if fresh
   const cached = promptCache.get(pid)
-  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
-    return cached.prompt
-  }
-  // Deduplicate concurrent fetches for same pid
-  if (promptInFlight.has(pid)) {
-    return promptInFlight.get(pid)
-  }
-  const fetchPromise = (async () => {
+  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) return cached.prompt
+  if (promptInFlight.has(pid)) return promptInFlight.get(pid)
+
+  const p = (async () => {
     try {
       const r = await fetch(`${WAMKT_URL}/api/voice/agent-prompt?project_id=${encodeURIComponent(pid)}`, {
         signal: AbortSignal.timeout(4000)
@@ -40,28 +34,24 @@ async function fetchPrompt(pid) {
         const d = await r.json()
         if (d.prompt) {
           promptCache.set(pid, { prompt: d.prompt, ts: Date.now() })
-          console.log(`[bridge] Prompt loaded for project="${pid}", length:`, d.prompt.length)
+          console.log(`[bridge] Prompt loaded project="${pid}" length=${d.prompt.length}`)
           return d.prompt
         }
       }
-    } catch (e) {
-      console.warn('[bridge] Could not load prompt:', e.message)
-    }
+    } catch (e) { console.warn('[bridge] Prompt fetch failed:', e.message) }
     return DEFAULT_PROMPT
   })()
-  promptInFlight.set(pid, fetchPromise)
-  fetchPromise.finally(() => promptInFlight.delete(pid))
-  return fetchPromise
+
+  promptInFlight.set(pid, p)
+  p.finally(() => promptInFlight.delete(pid))
+  return p
 }
 
-app.post('/voice/connect', async (req, res) => {
+app.post('/voice/connect', (req, res) => {
   const projectId = req.query.project_id || ''
   const host = req.headers.host || req.hostname
   const wsUrl = `wss://${host}/voice/stream?project_id=${encodeURIComponent(projectId)}`
-
-  // PRE-WARM: fetch prompt now so it's cached when WS opens
   if (projectId) fetchPrompt(projectId).catch(() => {})
-
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -79,21 +69,27 @@ const wss = new WebSocketServer({ server, path: '/voice/stream' })
 wss.on('connection', (twilioWs, req) => {
   let projectId = ''
   try {
-    const urlObj = new URL('http://localhost' + req.url)
-    projectId = urlObj.searchParams.get('project_id') || ''
+    projectId = new URL('http://localhost' + req.url).searchParams.get('project_id') || ''
   } catch {}
-
-  console.log(`[bridge] New call. project_id from URL="${projectId}"`)
 
   let openaiWs = null
   let streamSid = null
-  let greetingDone = false
+
+  // Echo suppression state
+  // When bot is generating audio, its sound echoes back through the lead's phone mic.
+  // We mute input processing during bot speech + a clearance window after.
+  let botSpeaking = false
+  let echoMuteUntil = 0          // timestamp until which we ignore speech_started events
+  const ECHO_CLEARANCE_MS = 1500 // ms after bot audio ends before trusting input again
+
+  // Call state
+  let greetingComplete = false
   let callTimer = null
   let noSpeechTimer = null
-  let leadSpeechCount = 0
+  let realLeadSpeechCount = 0
 
   const MAX_CALL_MS = 3 * 60 * 1000
-  const NO_SPEECH_MS = 20000   // 20s for lead to respond after greeting
+  const NO_SPEECH_MS = 22000
 
   function clearTimers() {
     clearTimeout(callTimer)
@@ -101,7 +97,7 @@ wss.on('connection', (twilioWs, req) => {
   }
 
   function hangup(reason) {
-    console.log(`[bridge] Hanging up: ${reason}`)
+    console.log(`[bridge] Hangup: ${reason}`)
     clearTimers()
     try { if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close() } catch {}
     try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close() } catch {}
@@ -112,12 +108,7 @@ wss.on('connection', (twilioWs, req) => {
 
     openaiWs = new WebSocket(
       'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
-      {
-        headers: {
-          'Authorization': `Bearer ${OPENAI_API_KEY}`,
-          'OpenAI-Beta': 'realtime=v1',
-        }
-      }
+      { headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'OpenAI-Beta': 'realtime=v1' } }
     )
 
     openaiWs.on('open', () => {
@@ -128,10 +119,8 @@ wss.on('connection', (twilioWs, req) => {
         session: {
           turn_detection: {
             type: 'server_vad',
-            threshold: 0.5,
-            // KEY FIX: 1200ms silence — respects natural pauses in human speech
-            // 600ms was cutting people off mid-sentence
-            silence_duration_ms: 1200,
+            threshold: 0.6,           // higher threshold reduces echo false positives
+            silence_duration_ms: 1000, // 1s pause = end of turn (balanced)
             prefix_padding_ms: 300,
           },
           input_audio_format: 'g711_ulaw',
@@ -145,14 +134,13 @@ wss.on('connection', (twilioWs, req) => {
         }
       }))
 
+      // Mark bot as speaking before greeting starts
+      botSpeaking = true
+
       // Trigger greeting
       openaiWs.send(JSON.stringify({
         type: 'conversation.item.create',
-        item: {
-          type: 'message',
-          role: 'user',
-          content: [{ type: 'input_text', text: '[Empieza la llamada]' }]
-        }
+        item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
       }))
       openaiWs.send(JSON.stringify({ type: 'response.create' }))
 
@@ -164,44 +152,57 @@ wss.on('connection', (twilioWs, req) => {
       try { event = JSON.parse(data.toString()) } catch { return }
 
       switch (event.type) {
+
         case 'response.audio.delta':
+          botSpeaking = true
           if (event.delta && streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({
-              event: 'media',
-              streamSid,
-              media: { payload: event.delta }
-            }))
+            twilioWs.send(JSON.stringify({ event: 'media', streamSid, media: { payload: event.delta } }))
           }
           break
 
         case 'response.audio.done':
+          // Bot finished an audio chunk — set echo clearance window
+          echoMuteUntil = Date.now() + ECHO_CLEARANCE_MS
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'bot_done' } }))
           }
           break
 
         case 'response.done':
-          if (!greetingDone) {
-            greetingDone = true
-            console.log('[bridge] Greeting done — waiting for lead')
+          botSpeaking = false
+          // Set clearance window after full response
+          echoMuteUntil = Date.now() + ECHO_CLEARANCE_MS
+
+          if (!greetingComplete) {
+            greetingComplete = true
+            console.log('[bridge] Greeting complete — listening for lead')
             noSpeechTimer = setTimeout(() => {
-              if (leadSpeechCount === 0) hangup('no lead speech')
+              if (realLeadSpeechCount === 0) hangup('no lead speech after greeting')
             }, NO_SPEECH_MS)
           }
           break
 
-        case 'input_audio_buffer.speech_started':
-          leadSpeechCount++
+        case 'input_audio_buffer.speech_started': {
+          const now = Date.now()
+          if (now < echoMuteUntil || botSpeaking) {
+            // This is echo of bot's own audio — ignore completely
+            console.log(`[bridge] Echo suppressed (bot=${botSpeaking} muteRemaining=${Math.max(0, echoMuteUntil - now)}ms)`)
+            break
+          }
+          // Real lead speech
+          realLeadSpeechCount++
           clearTimeout(noSpeechTimer)
           noSpeechTimer = null
-          console.log('[bridge] Speech started (#' + leadSpeechCount + ')')
+          console.log(`[bridge] Lead speech #${realLeadSpeechCount}`)
+          // Clear bot audio still buffered in Twilio
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }))
           }
           break
+        }
 
         case 'input_audio_buffer.speech_stopped':
-          console.log('[bridge] Speech stopped (#' + leadSpeechCount + ')')
+          console.log(`[bridge] Lead speech stopped #${realLeadSpeechCount}`)
           break
 
         case 'error':
@@ -230,19 +231,15 @@ wss.on('connection', (twilioWs, req) => {
       case 'start': {
         streamSid = msg.start?.streamSid || ''
         const params = msg.start?.customParameters || {}
-        const pidFromParams = params['project_id'] || ''
-        const resolvedPid = pidFromParams || projectId
-        console.log(`[bridge] Stream started. sid=${streamSid} project_id="${resolvedPid}"`)
+        const resolvedPid = params['project_id'] || projectId
+        console.log(`[bridge] Stream started sid=${streamSid} project_id="${resolvedPid}"`)
         startBridge(resolvedPid)
         break
       }
 
       case 'media':
         if (openaiWs?.readyState === WebSocket.OPEN && msg.media?.payload) {
-          openaiWs.send(JSON.stringify({
-            type: 'input_audio_buffer.append',
-            audio: msg.media.payload
-          }))
+          openaiWs.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }))
         }
         break
 
@@ -261,6 +258,4 @@ wss.on('connection', (twilioWs, req) => {
   twilioWs.on('error', (err) => console.error('[bridge] Twilio WS error:', err.message))
 })
 
-server.listen(PORT, () => {
-  console.log(`WAMKT Voice Bridge on port ${PORT}`)
-})
+server.listen(PORT, () => console.log(`WAMKT Voice Bridge on port ${PORT}`))
