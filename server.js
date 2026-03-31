@@ -15,10 +15,46 @@ const DEFAULT_PROMPT = 'Eres un representante de ventas. Llamas a un prospecto p
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'wamkt-voice-bridge' }))
 
-app.post('/voice/connect', (req, res) => {
+// Prompt cache: project_id -> { prompt, ts }
+// Avoids HTTP fetch on every call — refreshes every 5 minutes
+const promptCache = new Map()
+const CACHE_TTL_MS = 5 * 60 * 1000
+
+async function fetchPrompt(pid) {
+  const cached = promptCache.get(pid)
+  if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) {
+    console.log(`[bridge] Prompt from cache for project="${pid}", length:`, cached.prompt.length)
+    return cached.prompt
+  }
+  try {
+    const r = await fetch(`${WAMKT_URL}/api/voice/agent-prompt?project_id=${encodeURIComponent(pid)}`, {
+      signal: AbortSignal.timeout(4000)
+    })
+    if (r.ok) {
+      const d = await r.json()
+      if (d.prompt) {
+        promptCache.set(pid, { prompt: d.prompt, ts: Date.now() })
+        console.log(`[bridge] Prompt loaded for project="${pid}", length:`, d.prompt.length)
+        return d.prompt
+      }
+    }
+  } catch (e) {
+    console.warn('[bridge] Could not load prompt:', e.message)
+  }
+  console.log('[bridge] Using default prompt')
+  return DEFAULT_PROMPT
+}
+
+app.post('/voice/connect', async (req, res) => {
   const projectId = req.query.project_id || ''
   const host = req.headers.host || req.hostname
   const wsUrl = `wss://${host}/voice/stream?project_id=${encodeURIComponent(projectId)}`
+
+  // PRE-WARM: start fetching prompt immediately when call connects (before WS opens)
+  if (projectId) {
+    fetchPrompt(projectId).catch(() => {})
+  }
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -34,7 +70,6 @@ const server = http.createServer(app)
 const wss = new WebSocketServer({ server, path: '/voice/stream' })
 
 wss.on('connection', (twilioWs, req) => {
-  // Read project_id from URL query param (may be empty if Railway strips WS query params)
   let projectId = ''
   try {
     const urlObj = new URL('http://localhost' + req.url)
@@ -48,9 +83,10 @@ wss.on('connection', (twilioWs, req) => {
   let greetingDone = false
   let callTimer = null
   let noSpeechTimer = null
+  let leadSpeechCount = 0
 
-  const MAX_CALL_MS = 3 * 60 * 1000
-  const NO_SPEECH_MS = 12000
+  const MAX_CALL_MS = 3 * 60 * 1000   // 3 min max total
+  const NO_SPEECH_MS = 18000          // 18s — generous window for lead to respond after greeting
 
   function clearTimers() {
     clearTimeout(callTimer)
@@ -64,27 +100,9 @@ wss.on('connection', (twilioWs, req) => {
     try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close() } catch {}
   }
 
-  async function loadPrompt(pid) {
-    try {
-      const r = await fetch(`${WAMKT_URL}/api/voice/agent-prompt?project_id=${encodeURIComponent(pid)}`, {
-        signal: AbortSignal.timeout(5000)
-      })
-      if (r.ok) {
-        const d = await r.json()
-        if (d.prompt) {
-          console.log(`[bridge] Prompt loaded for project="${pid}", length:`, d.prompt.length)
-          return d.prompt
-        }
-      }
-    } catch (e) {
-      console.warn('[bridge] Could not load prompt:', e.message)
-    }
-    console.log('[bridge] Using default prompt')
-    return DEFAULT_PROMPT
-  }
-
   async function startBridge(pid) {
-    const systemPrompt = await loadPrompt(pid)
+    // Prompt should already be cached from voice/connect pre-warm
+    const systemPrompt = await fetchPrompt(pid)
 
     openaiWs = new WebSocket(
       'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
@@ -104,9 +122,9 @@ wss.on('connection', (twilioWs, req) => {
         session: {
           turn_detection: {
             type: 'server_vad',
-            threshold: 0.5,
-            silence_duration_ms: 800,
-            prefix_padding_ms: 300,
+            threshold: 0.55,       // slightly higher → less false positives from bot audio
+            silence_duration_ms: 600,  // faster response after lead stops speaking
+            prefix_padding_ms: 200,
           },
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
@@ -151,25 +169,39 @@ wss.on('connection', (twilioWs, req) => {
 
         case 'response.audio.done':
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-            twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'bot_speaking' } }))
+            twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'bot_done' } }))
           }
           break
 
         case 'response.done':
+          // Only mark greeting done after FIRST complete response from bot
+          // AND start no-speech timer only then (not before bot finishes speaking)
           if (!greetingDone) {
             greetingDone = true
             console.log('[bridge] Greeting done — waiting for lead')
-            noSpeechTimer = setTimeout(() => hangup('no lead speech'), NO_SPEECH_MS)
+            noSpeechTimer = setTimeout(() => {
+              if (leadSpeechCount === 0) {
+                hangup('no lead speech')
+              }
+            }, NO_SPEECH_MS)
           }
           break
 
         case 'input_audio_buffer.speech_started':
+          // Lead OR bot audio detected — increment to track real lead speech
+          leadSpeechCount++
           clearTimeout(noSpeechTimer)
           noSpeechTimer = null
-          console.log('[bridge] Lead speaking')
+          console.log('[bridge] Speech detected (#' + leadSpeechCount + ')')
+          // Clear any bot audio still buffered in Twilio
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }))
           }
+          break
+
+        case 'input_audio_buffer.speech_stopped':
+          // Lead stopped speaking — log only
+          console.log('[bridge] Speech stopped')
           break
 
         case 'error':
@@ -197,16 +229,11 @@ wss.on('connection', (twilioWs, req) => {
 
       case 'start':
         streamSid = msg.start?.streamSid || ''
-
-        // PRIMARY: read project_id from Twilio customParameters (most reliable)
+        // PRIMARY: Twilio customParameters (most reliable through Railway proxy)
         const params = msg.start?.customParameters || {}
         const pidFromParams = params['project_id'] || ''
-        
-        // FALLBACK: use project_id from WebSocket URL
         const resolvedPid = pidFromParams || projectId
-
-        console.log(`[bridge] Stream started. sid=${streamSid} project_id="${resolvedPid}" (params="${pidFromParams}" url="${projectId}")`)
-
+        console.log(`[bridge] Stream started. sid=${streamSid} project_id="${resolvedPid}"`)
         startBridge(resolvedPid)
         break
 
