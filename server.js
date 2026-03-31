@@ -91,7 +91,7 @@ wss.on('connection', (twilioWs, req) => {
       openaiWs.send(JSON.stringify({
         type: 'session.update',
         session: {
-          turn_detection: { type: 'server_vad', threshold: 0.5, silence_duration_ms: 700 },
+          turn_detection: { type: 'server_vad', threshold: 0.6, silence_duration_ms: 1000 },
           input_audio_format: 'g711_ulaw',
           output_audio_format: 'g711_ulaw',
           voice: 'shimmer', // Most natural Spanish voice in OpenAI
@@ -108,7 +108,7 @@ wss.on('connection', (twilioWs, req) => {
         item: {
           type: 'message',
           role: 'user',
-          content: [{ type: 'input_text', text: '[INICIO DE LLAMADA - saluda e introduce el motivo de tu llamada]' }]
+          content: [{ type: 'input_text', text: 'Empieza la llamada ahora.' }]
         }
       }))
       openaiWs.send(JSON.stringify({ type: 'response.create' }))
