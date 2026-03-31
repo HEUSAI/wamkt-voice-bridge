@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3001
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || ''
 const WAMKT_URL = process.env.WAMKT_URL || 'https://wamkt.notsy.com.mx'
 
-const DEFAULT_PROMPT = 'Eres un representante de ventas. Llamas a un prospecto para presentar una promoción del mes. Habla en español mexicano, tono amigable y directo. Máximo 2 oraciones por respuesta. Sin emojis ni markdown.'
+const DEFAULT_PROMPT = 'Eres un representante de ventas. Llamas a un prospecto para presentar una promoción. Habla en español mexicano, tono amigable y directo. Máximo 2 oraciones por respuesta. Sin emojis ni markdown.'
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'wamkt-voice-bridge' }))
 
@@ -24,7 +24,6 @@ async function fetchPrompt(pid) {
   const cached = promptCache.get(pid)
   if (cached && (Date.now() - cached.ts) < CACHE_TTL_MS) return cached.prompt
   if (promptInFlight.has(pid)) return promptInFlight.get(pid)
-
   const p = (async () => {
     try {
       const r = await fetch(`${WAMKT_URL}/api/voice/agent-prompt?project_id=${encodeURIComponent(pid)}`, {
@@ -41,7 +40,6 @@ async function fetchPrompt(pid) {
     } catch (e) { console.warn('[bridge] Prompt fetch failed:', e.message) }
     return DEFAULT_PROMPT
   })()
-
   promptInFlight.set(pid, p)
   p.finally(() => promptInFlight.delete(pid))
   return p
@@ -68,19 +66,15 @@ const wss = new WebSocketServer({ server, path: '/voice/stream' })
 
 wss.on('connection', (twilioWs, req) => {
   let projectId = ''
-  try {
-    projectId = new URL('http://localhost' + req.url).searchParams.get('project_id') || ''
-  } catch {}
+  try { projectId = new URL('http://localhost' + req.url).searchParams.get('project_id') || '' } catch {}
 
   let openaiWs = null
   let streamSid = null
 
-  // Echo suppression state
-  // When bot is generating audio, its sound echoes back through the lead's phone mic.
-  // We mute input processing during bot speech + a clearance window after.
-  let botSpeaking = false
-  let echoMuteUntil = 0          // timestamp until which we ignore speech_started events
-  const ECHO_CLEARANCE_MS = 1500 // ms after bot audio ends before trusting input again
+  // Bot speaking state — track to know when to suppress echo and when to clear Twilio buffer
+  let botSpeaking = true   // starts true: bot will speak first
+  let botAudioEndTime = 0  // when bot last finished audio chunk
+  const ECHO_CLEARANCE_MS = 1200  // ignore VAD triggers for 1.2s after bot finishes
 
   // Call state
   let greetingComplete = false
@@ -91,10 +85,7 @@ wss.on('connection', (twilioWs, req) => {
   const MAX_CALL_MS = 3 * 60 * 1000
   const NO_SPEECH_MS = 22000
 
-  function clearTimers() {
-    clearTimeout(callTimer)
-    clearTimeout(noSpeechTimer)
-  }
+  function clearTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer) }
 
   function hangup(reason) {
     console.log(`[bridge] Hangup: ${reason}`)
@@ -119,8 +110,8 @@ wss.on('connection', (twilioWs, req) => {
         session: {
           turn_detection: {
             type: 'server_vad',
-            threshold: 0.6,           // higher threshold reduces echo false positives
-            silence_duration_ms: 1000, // 1s pause = end of turn (balanced)
+            threshold: 0.6,
+            silence_duration_ms: 1000,
             prefix_padding_ms: 300,
           },
           input_audio_format: 'g711_ulaw',
@@ -134,10 +125,6 @@ wss.on('connection', (twilioWs, req) => {
         }
       }))
 
-      // Mark bot as speaking before greeting starts
-      botSpeaking = true
-
-      // Trigger greeting
       openaiWs.send(JSON.stringify({
         type: 'conversation.item.create',
         item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
@@ -161,8 +148,7 @@ wss.on('connection', (twilioWs, req) => {
           break
 
         case 'response.audio.done':
-          // Bot finished an audio chunk — set echo clearance window
-          echoMuteUntil = Date.now() + ECHO_CLEARANCE_MS
+          botAudioEndTime = Date.now()
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'bot_done' } }))
           }
@@ -170,9 +156,7 @@ wss.on('connection', (twilioWs, req) => {
 
         case 'response.done':
           botSpeaking = false
-          // Set clearance window after full response
-          echoMuteUntil = Date.now() + ECHO_CLEARANCE_MS
-
+          botAudioEndTime = Date.now()
           if (!greetingComplete) {
             greetingComplete = true
             console.log('[bridge] Greeting complete — listening for lead')
@@ -183,10 +167,9 @@ wss.on('connection', (twilioWs, req) => {
           break
 
         case 'input_audio_buffer.speech_started': {
-          const now = Date.now()
-          if (now < echoMuteUntil || botSpeaking) {
-            // This is echo of bot's own audio — ignore completely
-            console.log(`[bridge] Echo suppressed (bot=${botSpeaking} muteRemaining=${Math.max(0, echoMuteUntil - now)}ms)`)
+          const echoAge = Date.now() - botAudioEndTime
+          if (botSpeaking || echoAge < ECHO_CLEARANCE_MS) {
+            console.log(`[bridge] Echo suppressed (botSpeaking=${botSpeaking} echoAge=${echoAge}ms)`)
             break
           }
           // Real lead speech
@@ -194,8 +177,9 @@ wss.on('connection', (twilioWs, req) => {
           clearTimeout(noSpeechTimer)
           noSpeechTimer = null
           console.log(`[bridge] Lead speech #${realLeadSpeechCount}`)
-          // Clear bot audio still buffered in Twilio
-          if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+          // Only clear Twilio buffer if bot was speaking (interruption scenario)
+          // DO NOT send clear when bot has already finished — it disrupts the media stream
+          if (botSpeaking && streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }))
           }
           break
@@ -215,7 +199,13 @@ wss.on('connection', (twilioWs, req) => {
       }
     })
 
-    openaiWs.on('close', () => { clearTimers(); console.log('[bridge] OpenAI WS closed') })
+    openaiWs.on('close', (code, reason) => {
+      clearTimers()
+      console.log(`[bridge] OpenAI WS closed code=${code} reason=${reason?.toString() || 'none'}`)
+      // If OpenAI closes unexpectedly during active call, close Twilio too
+      try { if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close() } catch {}
+    })
+
     openaiWs.on('error', (err) => console.error('[bridge] OpenAI WS error:', err.message))
   }
 
