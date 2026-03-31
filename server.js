@@ -42,6 +42,21 @@ wss.on('connection', (twilioWs, req) => {
   let streamSid = null
   let isBotSpeaking = false
 
+  const MAX_CALL_MS = 3 * 60 * 1000  // 3 minutos max
+  const INITIAL_SILENCE_MS = 8000    // 8s sin respuesta inicial → cuelga
+
+  let callTimer = null
+  let initialSilenceTimer = null
+  let leadHasSpoken = false
+
+  function hangup() {
+    console.log('[bridge] Hanging up')
+    clearTimeout(callTimer)
+    clearTimeout(initialSilenceTimer)
+    if (openaiWs?.readyState === WebSocket.OPEN) openaiWs.close()
+    if (twilioWs.readyState === WebSocket.OPEN) twilioWs.close()
+  }
+
   async function loadPrompt() {
     try {
       const r = await fetch(`${WAMKT_URL}/api/voice/agent-prompt?project_id=${projectId}`, {
@@ -105,6 +120,20 @@ wss.on('connection', (twilioWs, req) => {
           instructions: 'Inicia la llamada ahora. Saluda e introdúcete mencionando de dónde llamas y el motivo brevemente.',
         }
       }))
+
+      // Max call duration
+      callTimer = setTimeout(() => {
+        console.log('[bridge] Max call duration reached, hanging up')
+        hangup()
+      }, MAX_CALL_MS)
+
+      // Initial silence — cancel when lead speaks
+      initialSilenceTimer = setTimeout(() => {
+        if (!leadHasSpoken) {
+          console.log('[bridge] No response from lead, hanging up')
+          hangup()
+        }
+      }, INITIAL_SILENCE_MS)
     })
 
     openaiWs.on('message', (data) => {
@@ -135,6 +164,8 @@ wss.on('connection', (twilioWs, req) => {
 
         case 'input_audio_buffer.speech_started':
           isBotSpeaking = false
+          leadHasSpoken = true
+          clearTimeout(initialSilenceTimer)
           if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
             twilioWs.send(JSON.stringify({ event: 'clear', streamSid }))
           }
@@ -153,7 +184,7 @@ wss.on('connection', (twilioWs, req) => {
       }
     })
 
-    openaiWs.on('close', () => console.log('[bridge] OpenAI WS closed'))
+    openaiWs.on('close', () => { clearTimeout(callTimer); clearTimeout(initialSilenceTimer); console.log('[bridge] OpenAI WS closed') })
     openaiWs.on('error', (err) => console.error('[bridge] OpenAI WS error:', err.message))
   }
 
@@ -192,6 +223,8 @@ wss.on('connection', (twilioWs, req) => {
   })
 
   twilioWs.on('close', () => {
+    clearTimeout(callTimer)
+    clearTimeout(initialSilenceTimer)
     console.log('[bridge] Twilio WS closed')
     openaiWs?.close?.()
   })
