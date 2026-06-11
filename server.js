@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.4'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.5'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -368,13 +368,15 @@ wss.on('connection', (tws, req) => {
   }
 
   // ── ElevenLabs streaming TTS (modo useEl): texto del modelo → voz mexicana ──
-  let elWs = null, elOpen = false, elQueue = [], elFinalCb = null
+  let elWs = null, elOpen = false, elQueue = [], elFinalCb = null, elGotText = false
   function elStart(onFinal) {
     elStop()
     elFinalCb = onFinal
+    elGotText = false
     elWs = new WebSocket(EL_URL, { headers: { 'xi-api-key': EL_KEY } })
     elWs.on('open', () => {
       elOpen = true
+      console.log('[el] ws abierto')
       elWs.send(JSON.stringify({ text: ' ', voice_settings: { stability: 0.5, similarity_boost: 0.8, speed: 1.0 } }))
       for (const o of elQueue) { try { elWs.send(JSON.stringify(o)) } catch {} }
       elQueue = []
@@ -486,6 +488,11 @@ wss.on('connection', (tws, req) => {
       let e
       try { e = JSON.parse(raw.toString()) } catch { return }
 
+      // DIAGNÓSTICO temporal: ver qué eventos manda OpenAI (solo response.*)
+      if (useEl && typeof e.type === 'string' && e.type.indexOf('response.') === 0 && e.type.indexOf('delta') < 0) {
+        console.log('[ev]', e.type)
+      }
+
       switch (e.type) {
         // Audio del modelo → Twilio (GA usa response.output_audio.*, preview usaba response.audio.*)
         case 'response.output_audio.delta':
@@ -499,11 +506,11 @@ wss.on('connection', (tws, req) => {
 
         // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
         case 'response.created':
-          if (useEl) elStart(markAudioDone)
+          if (useEl) { console.log('[el] elStart (response.created)'); elStart(markAudioDone) }
           break
         case 'response.output_text.delta':
         case 'response.text.delta':
-          if (useEl && e.delta) elPush(e.delta)
+          if (useEl && e.delta) { if (!elGotText) { elGotText = true; console.log('[el] primer texto: ' + e.type) } elPush(e.delta) }
           break
         case 'response.output_text.done':
         case 'response.text.done':
