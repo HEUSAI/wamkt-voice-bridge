@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.7'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.8'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -298,6 +298,18 @@ wss.on('connection', (tws, req) => {
     mediaBuffer = []
   }
 
+  // Dispara el saludo (mensaje inicial + response.create) una sola vez.
+  function fireGreeting() {
+    if (!greetingPending || !ows || ows.readyState !== 1) return
+    greetingPending = false
+    ows.send(JSON.stringify({
+      type: 'conversation.item.create',
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
+    }))
+    ows.send(JSON.stringify({ type: 'response.create' }))
+    console.log('[bridge] greeting fired')
+  }
+
   function initSession(prompt) {
     // session.update — esquema GA: audio anidado, sin temperature, tools incluidas
     ows.send(JSON.stringify({
@@ -319,9 +331,10 @@ wss.on('connection', (tws, req) => {
         }
       }
     }))
-    // El mensaje inicial + response.create se envían al recibir session.updated, para
-    // evitar la carrera que dejaba respuestas vacías (saludo mudo intermitente).
+    // El saludo se dispara con session.updated (evita respuesta vacía por carrera);
+    // fallback a 600ms por si session.updated no llega.
     greetingPending = true
+    setTimeout(fireGreeting, 600)
     callTimer = setTimeout(() => hangup('max call'), MAX_CALL_MS)
     owsReady = true
     // Descartar el audio acumulado antes del saludo (el "bueno?" del lead): si lo
@@ -537,6 +550,7 @@ wss.on('connection', (tws, req) => {
         }
 
         case 'response.done':
+          if (useEl) console.log('[ev] response.done status=' + (e.response && e.response.status) + ' details=' + JSON.stringify((e.response && e.response.status_details) || {}) + ' items=' + ((e.response && e.response.output && e.response.output.length) || 0))
           botSpeaking = false
           botEnd = Date.now()
           if (sayingGoodbye) {
@@ -576,15 +590,7 @@ wss.on('connection', (tws, req) => {
         case 'session.updated':
           console.log('[bridge] oai session updated OK')
           // Disparar el saludo SOLO cuando la sesión ya está aplicada (evita respuesta vacía)
-          if (greetingPending && ows?.readyState === 1) {
-            greetingPending = false
-            ows.send(JSON.stringify({
-              type: 'conversation.item.create',
-              item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
-            }))
-            ows.send(JSON.stringify({ type: 'response.create' }))
-            console.log('[bridge] greeting (post session.updated)')
-          }
+          fireGreeting()
           break
         case 'error':
           console.error('[bridge] OAI ERROR:', JSON.stringify(e.error))
