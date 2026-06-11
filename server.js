@@ -26,7 +26,7 @@ const TTS       = (process.env.TTS_PROVIDER || 'openai').toLowerCase()
 const EL_KEY    = process.env.ELEVEN_LABS_API_KEY || ''
 const EL_VOICE  = process.env.ELEVEN_VOICE_ID || 'ewn5JTa3lNPY8QVuZJi6'   // Ana Sofía (es-MX)
 const EL_MODEL  = process.env.ELEVEN_MODEL || 'eleven_flash_v2_5'         // baja latencia
-const USE_EL    = TTS === 'elevenlabs' && !!EL_KEY
+let useEl    = TTS === 'elevenlabs' && !!EL_KEY
 const EL_URL    = 'wss://api.elevenlabs.io/v1/text-to-speech/' + EL_VOICE +
   '/stream-input?model_id=' + EL_MODEL + '&output_format=ulaw_8000&inactivity_timeout=20&auto_mode=true'
 
@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.1'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -169,8 +169,8 @@ app.get('/health', (_, res) => res.json({
   service: 'wamkt-voice-bridge',
   version: VERSION,
   model: MODEL,
-  tts: USE_EL ? ('elevenlabs:' + EL_VOICE) : 'openai',
-  voice: USE_EL ? EL_VOICE : VOICE,
+  tts: useEl ? ('elevenlabs:' + EL_VOICE) : 'openai',
+  voice: useEl ? EL_VOICE : VOICE,
   vad: VAD_MODE,
   pool: pool.filter(w => w._ok).length + '/' + POOL_SIZE
 }))
@@ -282,7 +282,7 @@ wss.on('connection', (tws, req) => {
       session: {
         type: 'realtime',
         // En modo ElevenLabs la salida es TEXTO (la voz la genera EL); en OpenAI, audio.
-        output_modalities: USE_EL ? ['text'] : ['audio'],
+        output_modalities: useEl ? ['text'] : ['audio'],
         instructions: prompt,
         tools: TOOLS,
         tool_choice: 'auto',
@@ -292,7 +292,7 @@ wss.on('connection', (tws, req) => {
             turn_detection: turnDetection(),
             transcription: { model: 'gpt-4o-mini-transcribe', language: 'es' }
           },
-          ...(USE_EL ? {} : { output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 } })
+          ...(useEl ? {} : { output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 } })
         }
       }
     }))
@@ -345,7 +345,7 @@ wss.on('connection', (tws, req) => {
     }
   }
 
-  // ── ElevenLabs streaming TTS (modo USE_EL): texto del modelo → voz mexicana ──
+  // ── ElevenLabs streaming TTS (modo useEl): texto del modelo → voz mexicana ──
   let elWs = null, elOpen = false, elQueue = [], elFinalCb = null
   function elStart(onFinal) {
     elStop()
@@ -477,15 +477,15 @@ wss.on('connection', (tws, req) => {
 
         // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
         case 'response.created':
-          if (USE_EL) elStart(markAudioDone)
+          if (useEl) elStart(markAudioDone)
           break
         case 'response.output_text.delta':
         case 'response.text.delta':
-          if (USE_EL && e.delta) elPush(e.delta)
+          if (useEl && e.delta) elPush(e.delta)
           break
         case 'response.output_text.done':
         case 'response.text.done':
-          if (USE_EL) elFlush()
+          if (useEl) elFlush()
           if (e.text) transcript.push({ role: 'assistant', text: e.text })
           break
 
@@ -623,8 +623,25 @@ wss.on('connection', (tws, req) => {
   tws.on('error', e => console.error('[bridge] twilio err:', e.message))
 })
 
+// Preflight de ElevenLabs: si está activado pero la voz/plan/key no sirven,
+// caer automáticamente a OpenAI para que las llamadas NUNCA queden mudas.
+function preflightEl() {
+  if (!useEl) return
+  const test = new WebSocket(EL_URL, { headers: { 'xi-api-key': EL_KEY } })
+  let ok = false
+  const t = setTimeout(() => { if (!ok) { useEl = false; console.error('[el] preflight TIMEOUT — usando OpenAI'); try { test.close() } catch {} } }, 8000)
+  test.on('open', () => { test.send(JSON.stringify({ text: ' ' })); test.send(JSON.stringify({ text: 'hola ' })); test.send(JSON.stringify({ text: '' })) })
+  test.on('message', raw => {
+    let m; try { m = JSON.parse(raw.toString()) } catch { return }
+    if (m.audio && !ok) { ok = true; clearTimeout(t); console.log('[el] preflight OK — voz ' + EL_VOICE + ' lista'); try { test.close() } catch {} }
+  })
+  test.on('unexpected-response', (_r, res) => { clearTimeout(t); useEl = false; console.error('[el] preflight HTTP ' + res.statusCode + ' (key/plan/voice) — usando OpenAI') })
+  test.on('error', e => { clearTimeout(t); useEl = false; console.error('[el] preflight err: ' + e.message + ' — usando OpenAI') })
+}
+
 srv.listen(PORT, () => {
-  console.log('[bridge] WAMKT Voice Bridge v' + VERSION + ' on port ' + PORT + ' model=' + MODEL)
+  console.log('[bridge] WAMKT Voice Bridge v' + VERSION + ' on port ' + PORT + ' model=' + MODEL + ' tts=' + (useEl ? 'elevenlabs' : 'openai'))
   if (!KEY) console.warn('[bridge] FALTA OPENAI_API_KEY — el pool no se calentará y las llamadas quedarán mudas')
   for (let i = 0; i < POOL_SIZE; i++) newPoolWs()
+  preflightEl()
 })
