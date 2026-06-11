@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.2.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.2.1'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -87,7 +87,7 @@ const inflight = new Map()
 
 async function loadPrompt(pid) {
   const c = cache.get(pid)
-  if (c && Date.now() - c.t < 300000) return c.p
+  if (c && Date.now() - c.t < 1800000) return c.p
   if (inflight.has(pid)) return inflight.get(pid)
   const prom = (async () => {
     try {
@@ -196,6 +196,7 @@ wss.on('connection', (tws, req) => {
 
   let botSpeaking = true
   let botEnd = 0
+  let speakingTimer = null   // apaga botSpeaking si dejan de llegar frames de audio
   const ECHO_MS = 1200
 
   let greetingDone = false
@@ -215,7 +216,7 @@ wss.on('connection', (tws, req) => {
   const transcript = []          // { role, text }
   let outcome = null             // { interes, resumen, agendar }
 
-  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog) }
+  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog); clearTimeout(speakingTimer) }
 
   async function sendOutcome(reason) {
     if (outcomeSent) return
@@ -298,6 +299,10 @@ wss.on('connection', (tws, req) => {
       console.log('[bridge] primer audio del bot')
     }
     botSpeaking = true
+    // Debounce: si dejan de llegar frames por 800ms, el bot ya no está hablando.
+    // Evita que botSpeaking se quede pegado en true (suprimiría al lead como eco).
+    clearTimeout(speakingTimer)
+    speakingTimer = setTimeout(() => { botSpeaking = false; botEnd = Date.now() }, 800)
     if (delta && streamSid && tws.readyState === 1) {
       tws.send(JSON.stringify({ event: 'media', streamSid, media: { payload: delta } }))
     }
@@ -395,7 +400,9 @@ wss.on('connection', (tws, req) => {
           break
         case 'response.output_audio.done':
         case 'response.audio.done':
+          botSpeaking = false
           botEnd = Date.now()
+          clearTimeout(speakingTimer)
           if (streamSid && tws.readyState === 1) {
             tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'd' } }))
           }
