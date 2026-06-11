@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.9'  // bump para verificar deploys; visible en /health
+const VERSION = '2.7.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -534,12 +534,15 @@ wss.on('connection', (tws, req) => {
           if (e.text) transcript.push({ role: 'assistant', text: e.text })
           break
 
-        // Transcripción del bot (en modo EL es la fuente del texto que voz Ana Sofía)
+        // Transcripción del bot (en modo EL es la fuente del texto que voz Ana Sofía).
+        // Streaming: mandamos el texto a EL conforme se genera (baja latencia); EL con
+        // auto_mode genera en límites de palabra/frase para que suene fluido.
+        case 'response.output_audio_transcript.delta':
+          if (useEl && e.delta) { if (!elGotText) { elGotText = true; console.log('[el] streaming transcript -> EL') } elPush(e.delta) }
+          break
         case 'response.output_audio_transcript.done':
-          if (e.transcript) {
-            transcript.push({ role: 'assistant', text: e.transcript })
-            if (useEl) { console.log('[el] transcript (' + e.transcript.length + ' chars) -> EL'); elPush(e.transcript); elFlush() }
-          }
+          if (e.transcript) transcript.push({ role: 'assistant', text: e.transcript })
+          if (useEl) elFlush()
           break
         // Transcripción del lead
         case 'conversation.item.input_audio_transcription.completed':
