@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.8'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.9'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -316,8 +316,10 @@ wss.on('connection', (tws, req) => {
       type: 'session.update',
       session: {
         type: 'realtime',
-        // En modo ElevenLabs la salida es TEXTO (la voz la genera EL); en OpenAI, audio.
-        output_modalities: useEl ? ['text'] : ['audio'],
+        // SIEMPRE modo audio (el text-only de gpt-realtime da server_error ~50%).
+        // En modo EL ignoramos el audio de OpenAI y usamos su transcripción para que
+        // la voz la genere ElevenLabs.
+        output_modalities: ['audio'],
         instructions: prompt,
         tools: TOOLS,
         tool_choice: 'auto',
@@ -327,7 +329,7 @@ wss.on('connection', (tws, req) => {
             turn_detection: turnDetection(),
             transcription: { model: 'gpt-4o-mini-transcribe', language: 'es' }
           },
-          ...(useEl ? {} : { output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 } })
+          output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 }
         }
       }
     }))
@@ -509,11 +511,11 @@ wss.on('connection', (tws, req) => {
         // Audio del modelo → Twilio (GA usa response.output_audio.*, preview usaba response.audio.*)
         case 'response.output_audio.delta':
         case 'response.audio.delta':
-          sendAudioToTwilio(e.delta)   // solo modo OpenAI
+          if (!useEl) sendAudioToTwilio(e.delta)   // en EL ignoramos el audio de OpenAI
           break
         case 'response.output_audio.done':
         case 'response.audio.done':
-          markAudioDone()
+          if (!useEl) markAudioDone()   // en EL, markAudioDone lo dispara EL al terminar
           break
 
         // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
@@ -532,9 +534,12 @@ wss.on('connection', (tws, req) => {
           if (e.text) transcript.push({ role: 'assistant', text: e.text })
           break
 
-        // Transcripción del bot
+        // Transcripción del bot (en modo EL es la fuente del texto que voz Ana Sofía)
         case 'response.output_audio_transcript.done':
-          if (e.transcript) transcript.push({ role: 'assistant', text: e.transcript })
+          if (e.transcript) {
+            transcript.push({ role: 'assistant', text: e.transcript })
+            if (useEl) { console.log('[el] transcript (' + e.transcript.length + ' chars) -> EL'); elPush(e.transcript); elFlush() }
+          }
           break
         // Transcripción del lead
         case 'conversation.item.input_audio_transcription.completed':
