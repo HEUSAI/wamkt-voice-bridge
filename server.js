@@ -21,11 +21,20 @@ const MAX_CALL_MS = parseInt(process.env.MAX_CALL_MS || '180000', 10)
 const SECRET     = process.env.BRIDGE_SECRET || ''                   // firma callbacks a WAMKT
 const SAFETY_ID  = process.env.OAI_SAFETY_ID || 'wamkt-voice-bridge'
 
+// ── TTS: openai (default) | elevenlabs (voz mexicana nativa) ──────────────────
+const TTS       = (process.env.TTS_PROVIDER || 'openai').toLowerCase()
+const EL_KEY    = process.env.ELEVEN_LABS_API_KEY || ''
+const EL_VOICE  = process.env.ELEVEN_VOICE_ID || 'ewn5JTa3lNPY8QVuZJi6'   // Ana Sofía (es-MX)
+const EL_MODEL  = process.env.ELEVEN_MODEL || 'eleven_flash_v2_5'         // baja latencia
+const USE_EL    = TTS === 'elevenlabs' && !!EL_KEY
+const EL_URL    = 'wss://api.elevenlabs.io/v1/text-to-speech/' + EL_VOICE +
+  '/stream-input?model_id=' + EL_MODEL + '&output_format=ulaw_8000&inactivity_timeout=20&auto_mode=true'
+
 const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(MODEL)
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.5.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -160,7 +169,8 @@ app.get('/health', (_, res) => res.json({
   service: 'wamkt-voice-bridge',
   version: VERSION,
   model: MODEL,
-  voice: VOICE,
+  tts: USE_EL ? ('elevenlabs:' + EL_VOICE) : 'openai',
+  voice: USE_EL ? EL_VOICE : VOICE,
   vad: VAD_MODE,
   pool: pool.filter(w => w._ok).length + '/' + POOL_SIZE
 }))
@@ -250,6 +260,7 @@ wss.on('connection', (tws, req) => {
   function hangup(why) {
     console.log('[bridge] hangup:', why)
     stopTimers()
+    elStop()
     sendOutcome(why)
     try { if (ows?.readyState === 1) ows.close() } catch {}
     try { if (tws.readyState === 1) tws.close() } catch {}
@@ -270,7 +281,8 @@ wss.on('connection', (tws, req) => {
       type: 'session.update',
       session: {
         type: 'realtime',
-        output_modalities: ['audio'],
+        // En modo ElevenLabs la salida es TEXTO (la voz la genera EL); en OpenAI, audio.
+        output_modalities: USE_EL ? ['text'] : ['audio'],
         instructions: prompt,
         tools: TOOLS,
         tool_choice: 'auto',
@@ -280,7 +292,7 @@ wss.on('connection', (tws, req) => {
             turn_detection: turnDetection(),
             transcription: { model: 'gpt-4o-mini-transcribe', language: 'es' }
           },
-          output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 }
+          ...(USE_EL ? {} : { output: { format: { type: 'audio/pcmu' }, voice: VOICE, speed: 1.0 } })
         }
       }
     }))
@@ -322,6 +334,45 @@ wss.on('connection', (tws, req) => {
     }
   }
 
+  // Fin del audio de una respuesta: marca para Twilio (greet/bye/d) y resetea estado.
+  function markAudioDone() {
+    botSpeaking = false
+    botEnd = Date.now()
+    clearTimeout(speakingTimer)
+    if (streamSid && tws.readyState === 1) {
+      const markName = sayingGoodbye ? 'bye' : (inputGated ? 'greet' : 'd')
+      tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
+    }
+  }
+
+  // ── ElevenLabs streaming TTS (modo USE_EL): texto del modelo → voz mexicana ──
+  let elWs = null, elOpen = false, elQueue = [], elFinalCb = null
+  function elStart(onFinal) {
+    elStop()
+    elFinalCb = onFinal
+    elWs = new WebSocket(EL_URL, { headers: { 'xi-api-key': EL_KEY } })
+    elWs.on('open', () => {
+      elOpen = true
+      elWs.send(JSON.stringify({ text: ' ', voice_settings: { stability: 0.5, similarity_boost: 0.8, speed: 1.0 } }))
+      for (const o of elQueue) { try { elWs.send(JSON.stringify(o)) } catch {} }
+      elQueue = []
+    })
+    elWs.on('message', raw => {
+      let m; try { m = JSON.parse(raw.toString()) } catch { return }
+      if (m.audio) sendAudioToTwilio(m.audio)
+      if (m.isFinal) { const cb = elFinalCb; elFinalCb = null; if (cb) cb() }
+    })
+    elWs.on('error', e => console.error('[el] err:', e.message))
+    elWs.on('unexpected-response', (_r, res) => console.error('[el] handshake HTTP ' + res.statusCode + ' (revisa ELEVEN_LABS_API_KEY / plan / voice_id)'))
+  }
+  function elSend(o) { if (elOpen && elWs?.readyState === 1) { try { elWs.send(JSON.stringify(o)) } catch {} } else elQueue.push(o) }
+  function elPush(text) { if (text) elSend({ text: text }) }
+  function elFlush() { elSend({ text: '' }) }   // EOS → EL emite isFinal
+  function elStop() {
+    try { if (elWs && elWs.readyState <= 1) { elWs.removeAllListeners(); elWs.close() } } catch {}
+    elWs = null; elOpen = false; elQueue = []; elFinalCb = null
+  }
+
   // Reconexión con WS fresco cuando una conexión del pool entregó sesión pero no
   // audio. Quitamos listeners del viejo (para que su 'close' no cierre la llamada).
   function connectFresh() {
@@ -329,6 +380,7 @@ wss.on('connection', (tws, req) => {
     greetingAudioSeen = false
     greetingDone = false
     inputGated = true
+    elStop()
     clearTimeout(noSpeechTimer); noSpeechTimer = null
     try { if (ows) { ows.removeAllListeners(); if (ows.readyState <= 1) ows.close() } } catch {}
     console.log('[bridge] reconectando OAI con WS fresco (saludo no llegó)')
@@ -416,18 +468,25 @@ wss.on('connection', (tws, req) => {
         // Audio del modelo → Twilio (GA usa response.output_audio.*, preview usaba response.audio.*)
         case 'response.output_audio.delta':
         case 'response.audio.delta':
-          sendAudioToTwilio(e.delta)
+          sendAudioToTwilio(e.delta)   // solo modo OpenAI
           break
         case 'response.output_audio.done':
         case 'response.audio.done':
-          botSpeaking = false
-          botEnd = Date.now()
-          clearTimeout(speakingTimer)
-          if (streamSid && tws.readyState === 1) {
-            // mark 'bye' = despedida; 'greet' = fin del saludo (para empezar a escuchar); 'd' = normal
-            const markName = sayingGoodbye ? 'bye' : (inputGated ? 'greet' : 'd')
-            tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
-          }
+          markAudioDone()
+          break
+
+        // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
+        case 'response.created':
+          if (USE_EL) elStart(markAudioDone)
+          break
+        case 'response.output_text.delta':
+        case 'response.text.delta':
+          if (USE_EL && e.delta) elPush(e.delta)
+          break
+        case 'response.output_text.done':
+        case 'response.text.done':
+          if (USE_EL) elFlush()
+          if (e.text) transcript.push({ role: 'assistant', text: e.text })
           break
 
         // Transcripción del bot
