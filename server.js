@@ -197,6 +197,8 @@ wss.on('connection', (tws, req) => {
   let leadN = 0
   let pendingHangup = false
   let outcomeSent = false
+  let handoffRequested = false   // el modelo intentó transferir a un humano
+  let handoffOk = false          // la transferencia en vivo se logró
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
@@ -213,7 +215,8 @@ wss.on('connection', (tws, req) => {
         headers: { 'Content-Type': 'application/json', ...(SECRET ? { 'x-bridge-secret': SECRET } : {}) },
         body: JSON.stringify({
           call_sid: callSid, project_id: pid, campaign_id: campaignId,
-          reason, outcome, transcript, ended_at: new Date().toISOString()
+          reason, outcome, transcript, ended_at: new Date().toISOString(),
+          handoff_requested: handoffRequested, handoff_ok: handoffOk
         }),
         signal: AbortSignal.timeout(5000)
       })
@@ -285,10 +288,10 @@ wss.on('connection', (tws, req) => {
         signal: AbortSignal.timeout(8000)
       })
       const d = await r.json().catch(() => ({}))
-      return d.speak || 'Hecho.'
+      return { ok: !!d.ok, speak: d.speak || 'Hecho.' }
     } catch (e) {
       console.warn('[bridge] dispatcher falló:', e.message)
-      return 'No pude completar esa accion ahora.'
+      return { ok: false, speak: 'No pude completar esa accion ahora.' }
     }
   }
 
@@ -302,13 +305,22 @@ wss.on('connection', (tws, req) => {
       result = 'Resultado registrado.'
     } else if (name === 'enviar_info') {
       console.log('[bridge] tool enviar_info')
-      result = await callDispatcher('enviar_info', args)
+      result = (await callDispatcher('enviar_info', args)).speak
     } else if (name === 'transferir_a_humano') {
       console.log('[bridge] tool transferir_a_humano')
-      outcome = outcome || { interes: 'alto', resumen: 'Transferido a asesor', agendar: '' }
-      // Avisa al modelo; el redirect Twilio se ejecuta con gracia para que alcance a hablar
-      result = await callDispatcher('transferir_a_humano', args)
-      transferred = true
+      handoffRequested = true
+      const resp = await callDispatcher('transferir_a_humano', args)
+      result = resp.speak
+      if (resp.ok) {
+        // Enlace en vivo logrado: Twilio toma la llamada
+        handoffOk = true
+        transferred = true
+        outcome = { interes: 'alto', resumen: 'Transferido a asesor', agendar: outcome?.agendar || '' }
+      } else {
+        // No se logró enlazar: la llamada sigue, el modelo da el mensaje de respaldo
+        // y al cerrar se notifica al equipo (handoff_requested && !handoff_ok)
+        console.log('[bridge] handoff no enlazado -> se avisará al equipo al cerrar')
+      }
     } else if (name === 'colgar') {
       outcome = outcome || { interes: 'bajo', resumen: args.motivo || 'cierre', agendar: '' }
       pendingHangup = true
