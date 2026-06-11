@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.8.2'  // bump para verificar deploys; visible en /health
+const VERSION = '2.9.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -253,14 +253,15 @@ wss.on('connection', (tws, req) => {
   let currentPrompt = ''         // prompt vigente (para re-init en reconexión)
   let sayingGoodbye = false      // se pidió colgar; reproducir despedida antes de cerrar
   let goodbyeTimer = null        // fallback si Twilio no confirma el mark de despedida
-  let inputGated = true          // ignora el audio del lead hasta que el saludo termine de sonar
+  let inputGated = true          // half-duplex: ignora el audio del lead mientras el bot habla (evita eco/hablar sola)
   let greetingPending = false    // esperar session.updated antes de pedir el saludo
+  let ungateTimer = null         // respaldo para abrir el oído si el mark de Twilio se pierde
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
   let outcome = null             // { interes, resumen, agendar }
 
-  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog); clearTimeout(speakingTimer); clearTimeout(goodbyeTimer) }
+  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog); clearTimeout(speakingTimer); clearTimeout(goodbyeTimer); clearTimeout(ungateTimer) }
 
   async function sendOutcome(reason) {
     if (outcomeSent) return
@@ -377,9 +378,14 @@ wss.on('connection', (tws, req) => {
     botEnd = Date.now()
     clearTimeout(speakingTimer)
     if (streamSid && tws.readyState === 1) {
-      const markName = sayingGoodbye ? 'bye' : (inputGated ? 'greet' : 'd')
+      // 'bye' = despedida (cuelga); 'turn' = el bot terminó de hablar → al confirmarlo
+      // Twilio (mark de vuelta) abrimos el oído (half-duplex: no oír el propio eco).
+      const markName = sayingGoodbye ? 'bye' : 'turn'
       tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
     }
+    // Respaldo: si el mark se pierde, abrir el oído tras un tope generoso (no antes,
+    // para no reabrir mientras Twilio aún reproduce y reintroducir eco).
+    if (useEl && !sayingGoodbye) { clearTimeout(ungateTimer); ungateTimer = setTimeout(() => { inputGated = false; console.log('[bridge] ungate (respaldo)') }, 15000) }
   }
 
   // ── ElevenLabs streaming TTS (modo useEl): texto del modelo → voz mexicana ──
@@ -529,7 +535,7 @@ wss.on('connection', (tws, req) => {
 
         // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
         case 'response.created':
-          if (useEl) { console.log('[el] elStart (response.created)'); elStart(markAudioDone) }
+          if (useEl) { inputGated = true; clearTimeout(ungateTimer); elStart(markAudioDone) }   // half-duplex: gate mientras el bot habla
           break
         case 'response.output_text.delta':
         case 'response.text.delta':
@@ -579,8 +585,7 @@ wss.on('connection', (tws, req) => {
           if (!greetingDone) {
             greetingDone = true
             console.log('[bridge] greeting done')
-            // Fallback por si el mark 'greet' no regresa: abrir el oído ~1.5s después
-            setTimeout(() => { if (inputGated) { inputGated = false; console.log('[bridge] ungate fallback') } }, 1500)
+            // El oído se abre con el mark 'turn' de Twilio (fin de reproducción), no aquí.
             noSpeechTimer = setTimeout(() => { if (leadN === 0) hangup('no lead speech') }, 22000)
           }
           break
@@ -667,9 +672,10 @@ wss.on('connection', (tws, req) => {
       if (msg.mark?.name === 'bye') {
         console.log('[bridge] despedida reproducida — colgando')
         setTimeout(() => hangup('despedida ok'), 700)  // margen para no cortar la cola
-      } else if (msg.mark?.name === 'greet') {
-        inputGated = false
-        console.log('[bridge] saludo entregado — escuchando al lead')
+      } else if (msg.mark?.name === 'turn' || msg.mark?.name === 'greet') {
+        // El bot terminó de hablar y Twilio terminó de reproducir → abrir el oído
+        clearTimeout(ungateTimer)
+        if (inputGated) { inputGated = false; console.log('[bridge] bot terminó — escuchando al lead') }
       }
     } else if (msg.event === 'stop') {
       hangup('stream stopped')
