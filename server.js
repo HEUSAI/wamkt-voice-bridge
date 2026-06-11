@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.7.2'  // bump para verificar deploys; visible en /health
+const VERSION = '2.8.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -383,11 +383,12 @@ wss.on('connection', (tws, req) => {
   }
 
   // ── ElevenLabs streaming TTS (modo useEl): texto del modelo → voz mexicana ──
-  let elWs = null, elOpen = false, elQueue = [], elFinalCb = null, elGotText = false
+  let elWs = null, elOpen = false, elQueue = [], elFinalCb = null, elGotText = false, elBuf = ''
   function elStart(onFinal) {
     elStop()
     elFinalCb = onFinal
     elGotText = false
+    elBuf = ''
     elWs = new WebSocket(EL_URL, { headers: { 'xi-api-key': EL_KEY } })
     elWs.on('open', () => {
       elOpen = true
@@ -407,9 +408,16 @@ wss.on('connection', (tws, req) => {
   function elSend(o) { if (elOpen && elWs?.readyState === 1) { try { elWs.send(JSON.stringify(o)) } catch {} } else elQueue.push(o) }
   function elPush(text) { if (text) elSend({ text: text }) }
   function elFlush() { elSend({ text: '' }) }   // EOS → EL emite isFinal
+  // Acumula los deltas y los manda a EL en bloques con prosodia (límite de cláusula
+  // o ~50 chars), no fragmento por fragmento → voz fluida y sin perder latencia.
+  function elFeed(delta) {
+    elBuf += delta
+    if (/[.,;:!?…—\n]/.test(delta) || elBuf.length >= 50) { elPush(elBuf); elBuf = '' }
+  }
+  function elFeedFlush() { if (elBuf) { elPush(elBuf); elBuf = '' } elFlush() }
   function elStop() {
     try { if (elWs && elWs.readyState <= 1) { elWs.removeAllListeners(); elWs.close() } } catch {}
-    elWs = null; elOpen = false; elQueue = []; elFinalCb = null
+    elWs = null; elOpen = false; elQueue = []; elFinalCb = null; elBuf = ''
   }
 
   // Reconexión con WS fresco cuando una conexión del pool entregó sesión pero no
@@ -536,14 +544,13 @@ wss.on('connection', (tws, req) => {
           break
 
         // Transcripción del bot (en modo EL es la fuente del texto que voz Ana Sofía).
-        // Streaming: mandamos el texto a EL conforme se genera (baja latencia); EL con
-        // auto_mode genera en límites de palabra/frase para que suene fluido.
+        // Se acumula en bloques con prosodia antes de mandar a EL (voz fluida, baja latencia).
         case 'response.output_audio_transcript.delta':
-          if (useEl && e.delta) { if (!elGotText) { elGotText = true; console.log('[el] streaming transcript -> EL') } elPush(e.delta) }
+          if (useEl && e.delta) elFeed(e.delta)
           break
         case 'response.output_audio_transcript.done':
           if (e.transcript) transcript.push({ role: 'assistant', text: e.transcript })
-          if (useEl) elFlush()
+          if (useEl) elFeedFlush()
           break
         // Transcripción del lead
         case 'conversation.item.input_audio_transcription.completed':
