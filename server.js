@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.2.2'  // bump para verificar deploys; visible en /health
+const VERSION = '2.3.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -211,12 +211,14 @@ wss.on('connection', (tws, req) => {
   let greetingWatchdog = null    // vigila que el saludo realmente suene
   let reinitTried = false        // ya se reconectó una vez por saludo mudo
   let currentPrompt = ''         // prompt vigente (para re-init en reconexión)
+  let sayingGoodbye = false      // se pidió colgar; reproducir despedida antes de cerrar
+  let goodbyeTimer = null        // fallback si Twilio no confirma el mark de despedida
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
   let outcome = null             // { interes, resumen, agendar }
 
-  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog); clearTimeout(speakingTimer) }
+  function stopTimers() { clearTimeout(callTimer); clearTimeout(noSpeechTimer); clearTimeout(greetingWatchdog); clearTimeout(speakingTimer); clearTimeout(goodbyeTimer) }
 
   async function sendOutcome(reason) {
     if (outcomeSent) return
@@ -365,10 +367,11 @@ wss.on('connection', (tws, req) => {
         console.log('[bridge] handoff no enlazado -> se avisará al equipo al cerrar')
       }
     } else if (name === 'colgar') {
-      outcome = outcome || { interes: 'bajo', resumen: args.motivo || 'cierre', agendar: '' }
+      outcome = outcome || { interes: 'bajo', resumen: args.motivo || 'cierre', agendar: outcome?.agendar || '' }
       pendingHangup = true
+      sayingGoodbye = true   // generamos despedida hablada y colgamos cuando suene
       console.log('[bridge] tool colgar motivo=' + (args.motivo || ''))
-      result = 'Llamada finalizada.'
+      result = 'Despídete con una sola frase corta y cordial.'
     } else {
       result = 'Funcion no disponible.'
     }
@@ -379,10 +382,14 @@ wss.on('connection', (tws, req) => {
         type: 'conversation.item.create',
         item: { type: 'function_call_output', call_id: callId, output: result }
       }))
-      if (!pendingHangup) ows.send(JSON.stringify({ type: 'response.create' }))
+      if (sayingGoodbye) {
+        // Forzar una despedida hablada; NO colgamos hasta que Twilio confirme
+        // que la reprodujo (evento mark 'bye'), con fallback por timeout.
+        ows.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Despídete del prospecto en UNA sola frase corta y cordial. No hagas más preguntas.' } }))
+      } else if (!pendingHangup) {
+        ows.send(JSON.stringify({ type: 'response.create' }))
+      }
     }
-    // Si pidió colgar, dar gracia para que termine de hablar y cerrar
-    if (pendingHangup) setTimeout(() => hangup('tool:colgar'), 3500)
     // Si transfirió, Twilio toma el control de la llamada; cerramos OAI tras la despedida
     if (transferred) setTimeout(() => { sendOutcome('tool:transferir'); try { if (ows?.readyState === 1) ows.close() } catch {} }, 4000)
   }
@@ -404,7 +411,8 @@ wss.on('connection', (tws, req) => {
           botEnd = Date.now()
           clearTimeout(speakingTimer)
           if (streamSid && tws.readyState === 1) {
-            tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: 'd' } }))
+            // mark 'bye' cuando es la despedida: Twilio nos avisa al terminar de reproducirla
+            tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: sayingGoodbye ? 'bye' : 'd' } }))
           }
           break
 
@@ -428,7 +436,13 @@ wss.on('connection', (tws, req) => {
         case 'response.done':
           botSpeaking = false
           botEnd = Date.now()
-          if (pendingHangup) { hangup('tool:colgar:done'); break }
+          if (sayingGoodbye) {
+            // No colgar aún: esperamos el mark 'bye' de Twilio (despedida reproducida).
+            // Fallback por si el mark no llega (audio muy corto / sin audio).
+            clearTimeout(goodbyeTimer)
+            goodbyeTimer = setTimeout(() => hangup('despedida timeout'), 7000)
+            break
+          }
           if (!greetingDone) {
             greetingDone = true
             console.log('[bridge] greeting done')
@@ -508,6 +522,12 @@ wss.on('connection', (tws, req) => {
         if (msg.media?.payload) mediaBuffer.push(msg.media.payload)
       } else if (ows?.readyState === 1 && msg.media?.payload) {
         ows.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }))
+      }
+    } else if (msg.event === 'mark') {
+      // Twilio confirma que terminó de reproducir el audio hasta ese mark
+      if (msg.mark?.name === 'bye') {
+        console.log('[bridge] despedida reproducida — colgando')
+        hangup('despedida ok')
       }
     } else if (msg.event === 'stop') {
       hangup('stream stopped')
