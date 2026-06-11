@@ -25,6 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
+const VERSION = '2.1.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -152,6 +153,7 @@ function takeFromPool() {
 app.get('/health', (_, res) => res.json({
   ok: true,
   service: 'wamkt-voice-bridge',
+  version: VERSION,
   model: MODEL,
   voice: VOICE,
   vad: VAD_MODE,
