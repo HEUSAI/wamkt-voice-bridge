@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.1.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.1.1'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -132,6 +132,8 @@ function newPoolWs() {
   })
   ws.on('close', () => {
     const i = pool.indexOf(ws); if (i !== -1) pool.splice(i, 1)
+    // OpenAI cierra conexiones idle; reponer para no drenar el pool a 0
+    setTimeout(refill, 2000)
   })
   pool.push(ws)
 }
@@ -140,6 +142,9 @@ function refill() {
   const live = pool.filter(w => w.readyState <= 1).length
   for (let i = live; i < POOL_SIZE; i++) newPoolWs()
 }
+
+// Keepalive: mantener el pool lleno aunque OpenAI cierre conexiones idle
+setInterval(refill, 25000)
 
 function takeFromPool() {
   const i = pool.findIndex(w => w._ok && w.readyState === 1)
