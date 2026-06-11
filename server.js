@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.5'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.6'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -510,11 +510,13 @@ wss.on('connection', (tws, req) => {
           break
         case 'response.output_text.delta':
         case 'response.text.delta':
-          if (useEl && e.delta) { if (!elGotText) { elGotText = true; console.log('[el] primer texto: ' + e.type) } elPush(e.delta) }
+          // No mandamos fragmentos a EL (suena entrecortado). Esperamos el texto completo.
+          if (useEl && e.delta && !elGotText) { elGotText = true; console.log('[el] generando texto...') }
           break
         case 'response.output_text.done':
         case 'response.text.done':
-          if (useEl) elFlush()
+          // Texto completo de la respuesta → EL de una sola vez (audio fluido)
+          if (useEl && e.text) { console.log('[el] texto completo (' + e.text.length + ' chars) -> EL'); elPush(e.text); elFlush() }
           if (e.text) transcript.push({ role: 'assistant', text: e.text })
           break
 
@@ -593,7 +595,8 @@ wss.on('connection', (tws, req) => {
 
   async function start(resolvedPid) {
     currentPrompt = await loadPrompt(resolvedPid)
-    const pooled = takeFromPool()
+    // En modo ElevenLabs la conexión del pool da respuestas vacías; usar fresca.
+    const pooled = useEl ? null : takeFromPool()
     if (pooled) {
       console.log('[bridge] pooled WS — instant start')
       ows = pooled
