@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.2.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.2.2'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -525,7 +525,7 @@ wss.on('connection', (tws, req) => {
 })
 
 srv.listen(PORT, () => {
-  console.log('[bridge] WAMKT Voice Bridge on port ' + PORT + ' model=' + MODEL)
+  console.log('[bridge] WAMKT Voice Bridge v' + VERSION + ' on port ' + PORT + ' model=' + MODEL)
   if (!KEY) console.warn('[bridge] FALTA OPENAI_API_KEY — el pool no se calentará y las llamadas quedarán mudas')
   for (let i = 0; i < POOL_SIZE; i++) newPoolWs()
 })
