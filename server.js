@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.3.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.4.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -213,6 +213,7 @@ wss.on('connection', (tws, req) => {
   let currentPrompt = ''         // prompt vigente (para re-init en reconexión)
   let sayingGoodbye = false      // se pidió colgar; reproducir despedida antes de cerrar
   let goodbyeTimer = null        // fallback si Twilio no confirma el mark de despedida
+  let inputGated = true          // ignora el audio del lead hasta que el saludo termine de sonar
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
@@ -282,7 +283,10 @@ wss.on('connection', (tws, req) => {
     ows.send(JSON.stringify({ type: 'response.create' }))
     callTimer = setTimeout(() => hangup('max call'), MAX_CALL_MS)
     owsReady = true
-    flushBuffer()
+    // Descartar el audio acumulado antes del saludo (el "bueno?" del lead): si lo
+    // mandáramos, OpenAI cancelaría el saludo. Empezamos a escuchar tras el saludo.
+    mediaBuffer = []
+    inputGated = true
     console.log('[bridge] session initialized (model=' + MODEL + ' voice=' + VOICE + ' vad=' + VAD_MODE + ')')
     // Watchdog: si en 3.5s no llegó audio del bot, la conexión (del pool) está
     // muerta; reconectamos con un WS fresco y re-saludamos. Mata el silencio.
@@ -316,6 +320,7 @@ wss.on('connection', (tws, req) => {
     owsReady = false
     greetingAudioSeen = false
     greetingDone = false
+    inputGated = true
     clearTimeout(noSpeechTimer); noSpeechTimer = null
     try { if (ows) { ows.removeAllListeners(); if (ows.readyState <= 1) ows.close() } } catch {}
     console.log('[bridge] reconectando OAI con WS fresco (saludo no llegó)')
@@ -411,8 +416,9 @@ wss.on('connection', (tws, req) => {
           botEnd = Date.now()
           clearTimeout(speakingTimer)
           if (streamSid && tws.readyState === 1) {
-            // mark 'bye' cuando es la despedida: Twilio nos avisa al terminar de reproducirla
-            tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: sayingGoodbye ? 'bye' : 'd' } }))
+            // mark 'bye' = despedida; 'greet' = fin del saludo (para empezar a escuchar); 'd' = normal
+            const markName = sayingGoodbye ? 'bye' : (inputGated ? 'greet' : 'd')
+            tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
           }
           break
 
@@ -446,6 +452,8 @@ wss.on('connection', (tws, req) => {
           if (!greetingDone) {
             greetingDone = true
             console.log('[bridge] greeting done')
+            // Fallback por si el mark 'greet' no regresa: abrir el oído ~1.5s después
+            setTimeout(() => { if (inputGated) { inputGated = false; console.log('[bridge] ungate fallback') } }, 1500)
             noSpeechTimer = setTimeout(() => { if (leadN === 0) hangup('no lead speech') }, 22000)
           }
           break
@@ -518,9 +526,10 @@ wss.on('connection', (tws, req) => {
       console.log('[bridge] stream started sid=' + streamSid + ' call=' + callSid + ' pid=' + rPid)
       start(rPid)
     } else if (msg.event === 'media') {
-      if (!owsReady) {
-        if (msg.media?.payload) mediaBuffer.push(msg.media.payload)
-      } else if (ows?.readyState === 1 && msg.media?.payload) {
+      // Durante el saludo (inputGated) o reconexión ignoramos el audio del lead
+      // para que su "bueno?" no interrumpa ni cancele el saludo.
+      if (inputGated || !owsReady) return
+      if (ows?.readyState === 1 && msg.media?.payload) {
         ows.send(JSON.stringify({ type: 'input_audio_buffer.append', audio: msg.media.payload }))
       }
     } else if (msg.event === 'mark') {
@@ -528,6 +537,9 @@ wss.on('connection', (tws, req) => {
       if (msg.mark?.name === 'bye') {
         console.log('[bridge] despedida reproducida — colgando')
         hangup('despedida ok')
+      } else if (msg.mark?.name === 'greet') {
+        inputGated = false
+        console.log('[bridge] saludo entregado — escuchando al lead')
       }
     } else if (msg.event === 'stop') {
       hangup('stream stopped')
