@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.2'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -188,6 +188,23 @@ app.post('/voice/connect', (req, res) => {
     '<Parameter name="campaign_id" value="' + cid + '"/>' +
     '</Stream></Connect></Response>'
   res.type('text/xml').send(twiml)
+})
+
+// Diagnóstico: prueba la conexión a ElevenLabs con la llave de ESTE servidor.
+app.get('/voice/el-check', (req, res) => {
+  if (!EL_KEY) return res.json({ ok: false, reason: 'sin ELEVEN_LABS_API_KEY en el bridge', tts_provider: TTS })
+  const ws = new WebSocket(EL_URL, { headers: { 'xi-api-key': EL_KEY } })
+  let bytes = 0, done = false
+  const finish = (obj) => { if (done) return; done = true; try { ws.close() } catch {}; res.json({ ...obj, voice: EL_VOICE, model: EL_MODEL, tts_provider: TTS }) }
+  const t = setTimeout(() => finish({ ok: false, reason: 'timeout sin audio en 9s', bytes }), 9000)
+  ws.on('open', () => {
+    ws.send(JSON.stringify({ text: ' ', voice_settings: { stability: 0.5, similarity_boost: 0.8 } }))
+    ws.send(JSON.stringify({ text: 'Hola desde Notsy. ' }))
+    ws.send(JSON.stringify({ text: '' }))
+  })
+  ws.on('message', raw => { let m; try { m = JSON.parse(raw.toString()) } catch { return } if (m.audio) bytes += Buffer.from(m.audio, 'base64').length; if (m.isFinal) { clearTimeout(t); finish({ ok: bytes > 0, bytes }) } })
+  ws.on('unexpected-response', (_r, r2) => { clearTimeout(t); finish({ ok: false, reason: 'handshake HTTP ' + r2.statusCode + ' (key/plan/scope)' }) })
+  ws.on('error', e => { clearTimeout(t); finish({ ok: false, reason: 'ws error: ' + e.message }) })
 })
 
 // Refresca la caché del prompt al instante tras editar la config en WAMKT
