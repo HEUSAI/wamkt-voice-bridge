@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.8.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.8.2'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -323,7 +323,7 @@ wss.on('connection', (tws, req) => {
         instructions: prompt,
         tools: TOOLS,
         tool_choice: 'auto',
-        max_output_tokens: 300,   // tope ALTO: que las respuestas terminen (no truncar a media frase). El largo se controla por prompt.
+        max_output_tokens: 2000,  // en modo audio el cap cuenta tokens de AUDIO (~30-60/seg); 300 cortaba a los ~5s. 2000 ≈ tope anti-monólogo, no trunca respuestas normales. El largo se controla por prompt.
         audio: {
           input: {
             format: { type: 'audio/pcmu' },
