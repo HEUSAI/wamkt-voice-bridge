@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.2'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.3'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -202,7 +202,12 @@ app.get('/voice/el-check', (req, res) => {
     ws.send(JSON.stringify({ text: 'Hola desde Notsy. ' }))
     ws.send(JSON.stringify({ text: '' }))
   })
-  ws.on('message', raw => { let m; try { m = JSON.parse(raw.toString()) } catch { return } if (m.audio) bytes += Buffer.from(m.audio, 'base64').length; if (m.isFinal) { clearTimeout(t); finish({ ok: bytes > 0, bytes }) } })
+  ws.on('message', raw => {
+    let m; try { m = JSON.parse(raw.toString()) } catch { return }
+    if (m.audio) bytes += Buffer.from(m.audio, 'base64').length
+    if (m.error || (m.message && !m.audio)) { clearTimeout(t); return finish({ ok: false, reason: 'EL: ' + String(m.message || JSON.stringify(m.error)).slice(0, 160) }) }
+    if (m.isFinal) { clearTimeout(t); finish({ ok: bytes > 0, bytes }) }
+  })
   ws.on('unexpected-response', (_r, r2) => { clearTimeout(t); finish({ ok: false, reason: 'handshake HTTP ' + r2.statusCode + ' (key/plan/scope)' }) })
   ws.on('error', e => { clearTimeout(t); finish({ ok: false, reason: 'ws error: ' + e.message }) })
 })
