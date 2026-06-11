@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.4.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.5.0'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -178,6 +178,14 @@ app.post('/voice/connect', (req, res) => {
     '<Parameter name="campaign_id" value="' + cid + '"/>' +
     '</Stream></Connect></Response>'
   res.type('text/xml').send(twiml)
+})
+
+// Refresca la caché del prompt al instante tras editar la config en WAMKT
+app.post('/voice/reload', (req, res) => {
+  const pid = req.query.pid
+  if (pid) cache.delete(pid); else cache.clear()
+  console.log('[bridge] cache reload pid=' + (pid || 'all'))
+  res.json({ ok: true, cleared: pid || 'all' })
 })
 
 const srv = http.createServer(app)
