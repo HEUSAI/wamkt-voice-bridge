@@ -34,7 +34,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.6.6'  // bump para verificar deploys; visible en /health
+const VERSION = '2.6.7'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -254,6 +254,7 @@ wss.on('connection', (tws, req) => {
   let sayingGoodbye = false      // se pidió colgar; reproducir despedida antes de cerrar
   let goodbyeTimer = null        // fallback si Twilio no confirma el mark de despedida
   let inputGated = true          // ignora el audio del lead hasta que el saludo termine de sonar
+  let greetingPending = false    // esperar session.updated antes de pedir el saludo
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
@@ -318,11 +319,9 @@ wss.on('connection', (tws, req) => {
         }
       }
     }))
-    ows.send(JSON.stringify({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
-    }))
-    ows.send(JSON.stringify({ type: 'response.create' }))
+    // El mensaje inicial + response.create se envían al recibir session.updated, para
+    // evitar la carrera que dejaba respuestas vacías (saludo mudo intermitente).
+    greetingPending = true
     callTimer = setTimeout(() => hangup('max call'), MAX_CALL_MS)
     owsReady = true
     // Descartar el audio acumulado antes del saludo (el "bueno?" del lead): si lo
@@ -576,6 +575,16 @@ wss.on('connection', (tws, req) => {
           break
         case 'session.updated':
           console.log('[bridge] oai session updated OK')
+          // Disparar el saludo SOLO cuando la sesión ya está aplicada (evita respuesta vacía)
+          if (greetingPending && ows?.readyState === 1) {
+            greetingPending = false
+            ows.send(JSON.stringify({
+              type: 'conversation.item.create',
+              item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '[Empieza la llamada]' }] }
+            }))
+            ows.send(JSON.stringify({ type: 'response.create' }))
+            console.log('[bridge] greeting (post session.updated)')
+          }
           break
         case 'error':
           console.error('[bridge] OAI ERROR:', JSON.stringify(e.error))
