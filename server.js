@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.5.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.5.1'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -398,7 +398,7 @@ wss.on('connection', (tws, req) => {
       if (sayingGoodbye) {
         // Forzar una despedida hablada que CONFIRME lo acordado; NO colgamos hasta
         // que Twilio confirme que la reprodujo (mark 'bye'), con fallback por timeout.
-        ows.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Cierra la llamada cálidamente en una o dos frases cortas: confirma en voz lo que quedó acordado (la cita, el callback o el siguiente paso, con su fecha y hora si la hay) y despídete. No hagas más preguntas.' } }))
+        ows.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Despídete de forma cálida, humana y cercana (tono mexicano), en una o dos frases: agradece su tiempo con sinceridad, confirma con gusto lo que quedó acordado (la cita o el siguiente paso, con su fecha y hora si la hay) y deséale un excelente día. Que se sienta una despedida amable de persona real, no un cierre seco. No hagas más preguntas.' } }))
       } else if (!pendingHangup) {
         ows.send(JSON.stringify({ type: 'response.create' }))
       }
