@@ -25,7 +25,7 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.4.0'  // bump para verificar deploys; visible en /health
+const VERSION = '2.4.1'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
 
 function turnDetection() {
@@ -388,9 +388,9 @@ wss.on('connection', (tws, req) => {
         item: { type: 'function_call_output', call_id: callId, output: result }
       }))
       if (sayingGoodbye) {
-        // Forzar una despedida hablada; NO colgamos hasta que Twilio confirme
-        // que la reprodujo (evento mark 'bye'), con fallback por timeout.
-        ows.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Despídete del prospecto en UNA sola frase corta y cordial. No hagas más preguntas.' } }))
+        // Forzar una despedida hablada que CONFIRME lo acordado; NO colgamos hasta
+        // que Twilio confirme que la reprodujo (mark 'bye'), con fallback por timeout.
+        ows.send(JSON.stringify({ type: 'response.create', response: { instructions: 'Cierra la llamada cálidamente en una o dos frases cortas: confirma en voz lo que quedó acordado (la cita, el callback o el siguiente paso, con su fecha y hora si la hay) y despídete. No hagas más preguntas.' } }))
       } else if (!pendingHangup) {
         ows.send(JSON.stringify({ type: 'response.create' }))
       }
@@ -536,7 +536,7 @@ wss.on('connection', (tws, req) => {
       // Twilio confirma que terminó de reproducir el audio hasta ese mark
       if (msg.mark?.name === 'bye') {
         console.log('[bridge] despedida reproducida — colgando')
-        hangup('despedida ok')
+        setTimeout(() => hangup('despedida ok'), 700)  // margen para no cortar la cola
       } else if (msg.mark?.name === 'greet') {
         inputGated = false
         console.log('[bridge] saludo entregado — escuchando al lead')
