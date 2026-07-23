@@ -34,8 +34,9 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.9.0'  // bump para verificar deploys; visible en /health
-const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta.'
+const VERSION = '2.9.1'  // bump para verificar deploys; visible en /health
+const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta. ' +
+  'El arranque de la llamada suele transcribirse cortado: si lo primero que oyes es un monosilabo raro, confirma con calidez si te escuchan bien UNA SOLA VEZ y sigue normal; nunca repitas esa verificacion ni la encadenes — si algo llega cortado despues, pide que te repitan lo que dijeron.'
 
 function turnDetection() {
   if (VAD_MODE === 'server') {
@@ -256,6 +257,8 @@ wss.on('connection', (tws, req) => {
   let inputGated = true          // half-duplex: ignora el audio del lead mientras el bot habla (evita eco/hablar sola)
   let greetingPending = false    // esperar session.updated antes de pedir el saludo
   let ungateTimer = null         // respaldo para abrir el oído si el mark de Twilio se pierde
+  let respBytes = 0              // bytes µ-law enviados a Twilio en la respuesta actual (para estimar su duración)
+  let respFirstFrame = 0         // timestamp del primer frame de la respuesta actual
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
@@ -363,6 +366,10 @@ wss.on('connection', (tws, req) => {
       console.log('[bridge] primer audio del bot')
     }
     botSpeaking = true
+    if (delta) {
+      if (!respFirstFrame) respFirstFrame = Date.now()
+      respBytes += Math.floor(delta.length * 3 / 4)   // base64 → bytes (µ-law = 8000 bytes/seg reproducidos)
+    }
     // Debounce: si dejan de llegar frames por 800ms, el bot ya no está hablando.
     // Evita que botSpeaking se quede pegado en true (suprimiría al lead como eco).
     clearTimeout(speakingTimer)
@@ -383,9 +390,17 @@ wss.on('connection', (tws, req) => {
       const markName = sayingGoodbye ? 'bye' : 'turn'
       tws.send(JSON.stringify({ event: 'mark', streamSid, mark: { name: markName } }))
     }
-    // Respaldo: si el mark se pierde, abrir el oído tras un tope generoso (no antes,
-    // para no reabrir mientras Twilio aún reproduce y reintroducir eco).
-    if (useEl && !sayingGoodbye) { clearTimeout(ungateTimer); ungateTimer = setTimeout(() => { inputGated = false; console.log('[bridge] ungate (respaldo)') }, 15000) }
+    // Respaldo: si el mark se pierde, abrir el oído al FIN ESTIMADO de la reproducción
+    // (bytes µ-law enviados ÷ 8000/seg desde el primer frame) + margen — no un tope
+    // ciego de 15s: quedar sorda 12s tras una respuesta de 3s hacía que el lead
+    // contestara al vacío, llegara transcripción cortada y la agente insistiera con
+    // "¿me escuchas bien?" en bucle.
+    if (useEl && !sayingGoodbye) {
+      const playbackEnd = respFirstFrame ? respFirstFrame + respBytes / 8 : Date.now()
+      const delay = Math.min(15000, Math.max(1200, playbackEnd - Date.now() + 900))
+      clearTimeout(ungateTimer)
+      ungateTimer = setTimeout(() => { inputGated = false; console.log('[bridge] ungate (respaldo ' + Math.round(delay) + 'ms)') }, delay)
+    }
   }
 
   // ── ElevenLabs streaming TTS (modo useEl): texto del modelo → voz mexicana ──
@@ -535,7 +550,7 @@ wss.on('connection', (tws, req) => {
 
         // Modo ElevenLabs: la salida del modelo es TEXTO → se manda a EL para la voz
         case 'response.created':
-          if (useEl) { inputGated = true; clearTimeout(ungateTimer); elStart(markAudioDone) }   // half-duplex: gate mientras el bot habla
+          if (useEl) { inputGated = true; clearTimeout(ungateTimer); respBytes = 0; respFirstFrame = 0; elStart(markAudioDone) }   // half-duplex: gate mientras el bot habla
           break
         case 'response.output_text.delta':
         case 'response.text.delta':
