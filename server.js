@@ -34,9 +34,15 @@ const OAI_URL = 'wss://api.openai.com/v1/realtime?model=' + encodeURIComponent(M
 // GA: SIN header OpenAI-Beta. Safety identifier recomendado.
 const OAI_HEADERS = { Authorization: 'Bearer ' + KEY, 'OpenAI-Safety-Identifier': SAFETY_ID }
 
-const VERSION = '2.9.1'  // bump para verificar deploys; visible en /health
+const VERSION = '2.9.2'  // bump para verificar deploys; visible en /health
 const DEFAULT_PROMPT = 'Eres Sofia, representante de ventas de Notsy. Llamas a un prospecto para presentar el servicio. Espanol mexicano, tono amigable. Maximo 2 oraciones por respuesta. ' +
   'El arranque de la llamada suele transcribirse cortado: si lo primero que oyes es un monosilabo raro, confirma con calidez si te escuchan bien UNA SOLA VEZ y sigue normal; nunca repitas esa verificacion ni la encadenes — si algo llega cortado despues, pide que te repitan lo que dijeron.'
+
+/** Normaliza texto para comparar eco textual (minúsculas, sin acentos ni signos). */
+function normTxt(s) {
+  return String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9 ]+/g, ' ').replace(/\s+/g, ' ').trim()
+}
 
 function turnDetection() {
   if (VAD_MODE === 'server') {
@@ -259,6 +265,8 @@ wss.on('connection', (tws, req) => {
   let ungateTimer = null         // respaldo para abrir el oído si el mark de Twilio se pierde
   let respBytes = 0              // bytes µ-law enviados a Twilio en la respuesta actual (para estimar su duración)
   let respFirstFrame = 0         // timestamp del primer frame de la respuesta actual
+  let lastBotText = ''           // última frase hablada por el bot (para detectar eco textual)
+  let lastUngate = 0             // cuándo se abrió el oído por última vez (ventana del eco de cola)
 
   // Transcripción acumulada para el resultado post-llamada
   const transcript = []          // { role, text }
@@ -399,7 +407,7 @@ wss.on('connection', (tws, req) => {
       const playbackEnd = respFirstFrame ? respFirstFrame + respBytes / 8 : Date.now()
       const delay = Math.min(15000, Math.max(1200, playbackEnd - Date.now() + 900))
       clearTimeout(ungateTimer)
-      ungateTimer = setTimeout(() => { inputGated = false; console.log('[bridge] ungate (respaldo ' + Math.round(delay) + 'ms)') }, delay)
+      ungateTimer = setTimeout(() => { inputGated = false; lastUngate = Date.now(); console.log('[bridge] ungate (respaldo ' + Math.round(delay) + 'ms)') }, delay)
     }
   }
 
@@ -561,7 +569,7 @@ wss.on('connection', (tws, req) => {
         case 'response.text.done':
           // Texto completo de la respuesta → EL de una sola vez (audio fluido)
           if (useEl && e.text) { console.log('[el] texto completo (' + e.text.length + ' chars) -> EL'); elPush(e.text); elFlush() }
-          if (e.text) transcript.push({ role: 'assistant', text: e.text })
+          if (e.text) { transcript.push({ role: 'assistant', text: e.text }); lastBotText = e.text }
           break
 
         // Transcripción del bot (en modo EL es la fuente del texto que voz Ana Sofía).
@@ -570,13 +578,32 @@ wss.on('connection', (tws, req) => {
           if (useEl && e.delta) elFeed(e.delta)
           break
         case 'response.output_audio_transcript.done':
-          if (e.transcript) transcript.push({ role: 'assistant', text: e.transcript })
+          if (e.transcript) { transcript.push({ role: 'assistant', text: e.transcript }); lastBotText = e.transcript }
           if (useEl) elFeedFlush()
           break
         // Transcripción del lead
-        case 'conversation.item.input_audio_transcription.completed':
-          if (e.transcript) transcript.push({ role: 'user', text: e.transcript })
+        case 'conversation.item.input_audio_transcription.completed': {
+          const heard = String(e.transcript || '').trim()
+          const h = normTxt(heard), b = normTxt(lastBotText)
+          // FILTRO DE ECO TEXTUAL: el eco de línea de las ÚLTIMAS palabras del bot
+          // regresa 100-600ms DESPUÉS de que Twilio terminó de reproducir — o sea,
+          // ya con el oído abierto (el gate half-duplex no lo cubre). Si lo "dicho
+          // por el lead" es un fragmento de la última frase del bot y llega recién
+          // abierto el oído, es su propio eco: se borra el item y se cancela la
+          // respuesta que el VAD haya disparado. Sin esto el modelo se contesta a
+          // sí mismo ("¿me escuchas bien?" → "yo te escucho perfecto").
+          if (h && b && h.length >= 4 && b.includes(h) && Date.now() - lastUngate < 3500) {
+            console.log('[bridge] eco textual del bot descartado: "' + heard.slice(0, 60) + '"')
+            try {
+              if (e.item_id) ows.send(JSON.stringify({ type: 'conversation.item.delete', item_id: e.item_id }))
+              ows.send(JSON.stringify({ type: 'response.cancel' }))
+            } catch {}
+            if (useEl) { elStop(); inputGated = false; lastUngate = Date.now() }  // la respuesta cancelada ya no producirá mark
+            break
+          }
+          if (heard) transcript.push({ role: 'user', text: heard })
           break
+        }
 
         // Function calling
         case 'response.function_call_arguments.done': {
@@ -690,7 +717,7 @@ wss.on('connection', (tws, req) => {
       } else if (msg.mark?.name === 'turn' || msg.mark?.name === 'greet') {
         // El bot terminó de hablar y Twilio terminó de reproducir → abrir el oído
         clearTimeout(ungateTimer)
-        if (inputGated) { inputGated = false; console.log('[bridge] bot terminó — escuchando al lead') }
+        if (inputGated) { inputGated = false; lastUngate = Date.now(); console.log('[bridge] bot terminó — escuchando al lead') }
       }
     } else if (msg.event === 'stop') {
       hangup('stream stopped')
