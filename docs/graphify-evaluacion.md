@@ -37,9 +37,20 @@ graphify extract demo --code-only
 → "1 file(s) skipped as potentially sensitive": .env.example
 ```
 
-**Omitió `.env.example` por sí solo.** En un repo con `OPENAI_API_KEY`, `BRIDGE_SECRET` y
-credenciales de Twilio, eso importa: la protección de secretos no es solo una promesa del README,
-se observa en ejecución.
+Corrido sobre una **copia desechable** generada con `git archive HEAD` (solo archivos versionados),
+en el scratchpad de la sesión. No se ejecutó sobre el working directory, ni sobre el servicio en
+EasyPanel.
+
+**Omitió `.env.example` por sí solo** — pero hay que ser precisos sobre qué prueba eso y qué no:
+
+- **Sí demuestra** que el mecanismo de clasificación existe y se ejecuta: reconoce archivos con
+  forma de `.env` y los excluye de la extracción.
+- **No demuestra** que proteja credenciales reales. En este contenedor no hay ninguna: no existe
+  `.env` (está en `.gitignore`), y `.env.example` solo contiene placeholders (`sk-...`, valores
+  vacíos). Omitió un archivo sin secretos.
+
+La validación real está pendiente y es el primer paso del protocolo (§3, Fase 0): la **prueba de
+canario**.
 
 ### Condiciones para aprobar
 
@@ -159,8 +170,37 @@ graphify --version                     # debe decir 0.9.28
 Congelar el terreno de prueba:
 - Rama dedicada en `wamkt-notsy`, sin cambios de código durante la medición.
 - Añadir `graphify-out/` al `.gitignore`.
-- Verificar que `.env` y similares aparezcan como *skipped as potentially sensitive*. Si algún
-  archivo con secretos **no** se omite, abortar.
+
+#### Prueba de canario — bloqueante, va antes que todo lo demás
+
+La auditoría solo verificó que graphify **omite archivos con forma de `.env`**; no que proteja
+credenciales reales (no había ninguna disponible). Esto lo valida de verdad, y hay que hacerlo
+sobre una **copia desechable**, nunca sobre el repo con el `.env` real:
+
+```bash
+# 1. copia desechable con SOLO archivos versionados (nunca el .env real)
+cd /tmp && rm -rf canario && mkdir canario
+git -C ~/wamkt-notsy archive HEAD | tar -x -C /tmp/canario
+
+# 2. sembrar secretos falsos pero únicos y rastreables
+cd /tmp/canario
+printf 'OPENAI_API_KEY=sk-CANARIO-9f3a2b7c1e\nBRIDGE_SECRET=CANARIO-9f3a2b7c1e\n' > .env
+printf 'const TOKEN = "CANARIO-9f3a2b7c1e"  // secreto embebido en código\n' > config-canario.js
+
+# 3. extraer y buscar la fuga
+graphify extract . --code-only
+grep -rn "CANARIO-9f3a2b7c1e" graphify-out/ && echo "❌ FUGA — ABORTAR" || echo "✅ sin fuga"
+```
+
+Dos resultados distintos, y ambos informan:
+
+| Caso | Qué significa |
+|---|---|
+| `.env` omitido **y** sin rastro del canario en `graphify-out/` | Aprobado, seguir a Fase 1 |
+| El canario aparece desde `config-canario.js` | Esperado — graphify indexa código, y un secreto **hardcodeado en código** sí entra al grafo. No es un fallo de graphify, es una señal de que hay secretos donde no deben estar. Corregir eso primero |
+| El canario aparece desde `.env` | **Abortar.** El filtro de sensibles falló |
+
+Limpiar al terminar: `rm -rf /tmp/canario`.
 
 ### Fase 1 — Línea base SIN graphify (40 min) ← *va primero, obligatorio*
 
@@ -238,9 +278,10 @@ grep -rl graphify ~/.claude/ --exclude-dir={projects,sessions,shell-snapshots} 2
 
 ## 5. Resumen ejecutivo
 
-- **¿Es seguro?** Sí. Apache-2.0, sin telemetría, sin ejecución dinámica de código, dependencias
-  limpias, seguridad bien pensada, y omite archivos con secretos por sí solo. Es el vector de
-  riesgo bajo de esta evaluación.
+- **¿Es seguro?** Sí, con una salvedad pendiente. Apache-2.0, sin telemetría, sin ejecución
+  dinámica de código, dependencias limpias y seguridad bien pensada. Excluye archivos con forma de
+  `.env`, aunque eso se verificó contra placeholders, no contra credenciales reales: falta la
+  prueba de canario (§3, Fase 0) antes de apuntarlo a un repo con secretos de verdad.
 - **¿Sirve?** Sin decidir — y esa es la pregunta que importa. El "71x" y el "18.3x" están
   construidos sobre una línea base irreal. La única evidencia independiente apunta a ~6%.
 - **¿Dónde?** En `wamkt-notsy`, nunca en este repo (~13k tokens totales: no hay nada que ahorrar).
